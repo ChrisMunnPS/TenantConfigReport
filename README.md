@@ -16,7 +16,7 @@
 
 `Get-TenantConfigReport.ps1` connects to a Microsoft 365 tenant as a **Global Admin / Global Reader** and produces one report covering identity, security, mail, and file-sharing configuration in a single run. It's built for the moment you're looking at a tenant for the first time — a new client, a new job, an audit — and need the full picture without stitching together a dozen admin-center screens.
 
-It pulls from three services — **Microsoft Graph (Entra ID)**, **Exchange Online**, and **SharePoint Online** — and outputs **three formats** from one data collection pass: an interactive **HTML dashboard**, a **Markdown** file (with full per-user detail, easy to diff or paste into a wiki), and a **PDF** (client-ready, one click to share).
+It pulls from **four sources** — **Microsoft Graph (Entra ID)**, **Microsoft Secure Score**, **Exchange Online**, and **SharePoint Online** — and outputs **three formats** from one data collection pass: an interactive **HTML dashboard**, a **Markdown** file (with full per-user detail, easy to diff or paste into a wiki), and a **PDF** (client-ready, one click to share).
 
 | | |
 |---|---|
@@ -49,8 +49,10 @@ It pulls from three services — **Microsoft Graph (Entra ID)**, **Exchange Onli
 ## ✨ Features
 
 - 📊 **Dashboard-first HTML report** — summary cards at the top, sticky nav, color-coded health pills, full detail tables below
-- 🧱 **Three services, one run** — Entra ID, Exchange Online, SharePoint Online / OneDrive
+- 🧱 **Four sources, one run** — Entra ID, Microsoft Secure Score, Exchange Online, SharePoint Online / OneDrive
 - 🛡️ **Security-aware** — Conditional Access, MFA/auth method registration, admin role sprawl, risky app permissions all called out
+- 🎯 **Identity Secure Score** — overall + Identity-category score, with the top unimplemented controls ranked by points available
+- 🔓 **User settings audit** — the Entra admin center's Users → User settings blade (app registration, group creation, guest invites, and more), permissive defaults flagged
 - 🩹 **Fails gracefully** — missing module or blocked connection skips that section and logs a warning instead of aborting
 - 🏢 **MSP-friendly** — `-TenantId` switches target tenant without reinstalling anything
 - 📤 **Three output formats** from a single data pull — HTML, Markdown, PDF (via headless Edge, no extra dependency)
@@ -72,9 +74,9 @@ Below is what the report looks like for a **fictitious** tenant, `contoso.com` �
 |---|---|---|---|
 | **1**<br>avg 87% consumed | **3**<br>✅ healthy range | **8**<br>6 enabled · 1 report-only | **80%**<br>⚠️ 1 admin without MFA |
 
-| 📧 Mailboxes | 📁 SharePoint Storage |
-|---|---|
-| **140**<br>4 mail flow rules | **245.6 GB**<br>60 sites |
+| 📧 Mailboxes | 📁 SharePoint Storage | 🎯 Secure Score | 🔓 User Settings |
+|---|---|---|---|
+| **140**<br>4 mail flow rules | **245.6 GB**<br>60 sites | **70.2%**<br>Identity: 74.0% | **3**<br>⚠️ permissive default(s) enabled |
 
 ### Detail section excerpt — Licenses
 
@@ -106,6 +108,36 @@ Below is what the report looks like for a **fictitious** tenant, `contoso.com` �
 | Security Defaults Enabled | False |
 | Admins without MFA | 1 — `admin2@contoso.com` |
 
+### Detail section excerpt — Identity Secure Score
+
+| Metric | Value |
+|---|---|
+| Overall Secure Score | 210.5 / 300 (70.2%) |
+| Identity Category Score | 74.0% |
+| Identity Controls Tracked | 20 |
+
+**Top unimplemented Identity controls:**
+
+| Control | Description | Current | Max | Points Available |
+|---|---|---|---|---|
+| MFARegistrationV2 | Ensure all users can complete MFA registration | 2.0 | 10 | 🔴 **8.0** |
+
+### Detail section excerpt — User Settings
+
+*Mirrors Entra admin center → Users → User settings. Amber flags a permissive default Microsoft recommends reviewing.*
+
+| Setting | Value |
+|---|---|
+| Users can register applications | 🟠 True |
+| Users can create security groups | 🟠 True |
+| Users can create Microsoft 365 groups | 🟠 True |
+| Users can create tenants | 🟢 False |
+| Users can read other users' full profiles | 🟠 True |
+| Admins can use Self-Service Password Reset | 🟢 True |
+| Guest invite setting | everyone |
+| Email-verified users can join org | 🟢 False |
+| Legacy MSOL PowerShell blocked | 🟠 False |
+
 ### Collection Warnings (shown when a section can't be reached)
 
 > ⚠️ `[ExchangeOnline] Connection failed: Access denied — account lacks an Exchange admin role`
@@ -121,7 +153,7 @@ The rest of the report renders normally; only that one section shows as skipped.
 - **Microsoft Edge** installed, for PDF export (HTML/Markdown work without it)
 - An account with **Global Reader** or **Global Admin** in the target tenant
 - Internet access to install PowerShell modules on first run:
-  - `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Groups`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Identity.SignIns`, `Microsoft.Graph.Applications`, `Microsoft.Graph.Reports`
+  - `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Groups`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Identity.SignIns`, `Microsoft.Graph.Applications`, `Microsoft.Graph.Reports`, `Microsoft.Graph.Security`
   - `ExchangeOnlineManagement` (unless `-SkipExchange`)
   - `PnP.PowerShell` (unless `-SkipSharePoint`)
 
@@ -184,13 +216,15 @@ You'll be prompted to sign in once per connected service (up to three times: Gra
 | 🧩 Applications | App registrations ranked by requested permission count — highest-risk apps surface first |
 | 📧 Exchange Online | Mailbox counts by type, mail flow (transport) rules, inbound/outbound connectors |
 | 📁 SharePoint & OneDrive | Site count, total storage, tenant/OneDrive sharing capability, default link permission, legacy auth status |
+| 🎯 Identity Secure Score | Overall + Identity-category score, control-level breakdown, top unimplemented controls ranked by points available |
+| 🔓 User Settings | App registration, security/M365 group creation, tenant creation, profile visibility, admin SSPR, guest invites, email-verified join, legacy MSOL PowerShell — each flagged against Microsoft's recommended default |
 
 ---
 
 ## 🔐 Permissions & Scopes
 
 **Microsoft Graph scopes requested:**
-`Organization.Read.All` · `User.Read.All` · `Group.Read.All` · `RoleManagement.Read.Directory` · `Policy.Read.All` · `Reports.Read.All` · `Application.Read.All` · `AuditLog.Read.All` · `Directory.Read.All`
+`Organization.Read.All` · `User.Read.All` · `Group.Read.All` · `RoleManagement.Read.Directory` · `Policy.Read.All` · `Reports.Read.All` · `Application.Read.All` · `AuditLog.Read.All` · `Directory.Read.All` · `SecurityEvents.Read.All`
 
 All scopes are **read-only**. Exchange Online and SharePoint Online connections use the same signed-in admin account and only call read cmdlets.
 
@@ -215,9 +249,10 @@ TenantReport_contoso_20260915-143000/
 | No PDF produced | `msedge.exe` not found on this machine | Install Microsoft Edge, or use `-SkipPdf` and open the HTML/Markdown instead |
 | SharePoint section is slow | Large number of site collections | Expected — `Get-PnPTenantSite` scales with site count; let it finish |
 | Prompted to sign in multiple times | Normal | Graph, Exchange Online, and SharePoint Online each authenticate separately |
+| Identity Category score shows "N/A" | Max-score data unavailable for one or more controls from `Get-MgSecuritySecureScoreControlProfile` | Overall Secure Score and the raw control list still display; this only affects the calculated Identity percentage |
+
 
 ---
-
 
 ## 🤝 Contributing
 
