@@ -54,14 +54,14 @@
     Requires (installed automatically if missing, with confirmation):
         Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Groups,
         Microsoft.Graph.Identity.DirectoryManagement, Microsoft.Graph.Identity.SignIns,
-        Microsoft.Graph.Applications, Microsoft.Graph.Reports
+        Microsoft.Graph.Applications, Microsoft.Graph.Reports, Microsoft.Graph.Security
         ExchangeOnlineManagement   (unless -SkipExchange)
         PnP.PowerShell             (unless -SkipSharePoint)
 
     Sign in with an account holding Global Reader (read-only, recommended) or Global Admin.
     Graph scopes requested: Organization.Read.All, User.Read.All, Group.Read.All,
     RoleManagement.Read.Directory, Policy.Read.All, Reports.Read.All, Application.Read.All,
-    AuditLog.Read.All, Directory.Read.All
+    AuditLog.Read.All, Directory.Read.All, SecurityEvents.Read.All
 
     PDF export shells out to msedge.exe in headless mode. If Edge isn't found, PDF generation is
     skipped with a warning — HTML/Markdown are unaffected.
@@ -101,6 +101,8 @@ $script:Report = [ordered]@{
     Applications      = $null
     ExchangeOnline    = $null
     SharePoint        = $null
+    SecureScore       = $null
+    UserSettings      = $null
 }
 $script:Warnings = [System.Collections.Generic.List[string]]::new()
 
@@ -155,7 +157,8 @@ function Connect-TenantGraph {
         'Microsoft.Graph.Identity.DirectoryManagement',
         'Microsoft.Graph.Identity.SignIns',
         'Microsoft.Graph.Applications',
-        'Microsoft.Graph.Reports'
+        'Microsoft.Graph.Reports',
+        'Microsoft.Graph.Security'
     )
     foreach ($m in $requiredModules) {
         if (-not (Test-ModuleAvailable -Name $m)) {
@@ -172,7 +175,8 @@ function Connect-TenantGraph {
         'Reports.Read.All',
         'Application.Read.All',
         'AuditLog.Read.All',
-        'Directory.Read.All'
+        'Directory.Read.All',
+        'SecurityEvents.Read.All'
     )
 
     $connectParams = @{
@@ -568,6 +572,105 @@ function Get-SharePointData {
     }
 }
 
+function Get-SecureScoreData {
+    Write-Section 'Collecting Identity Secure Score'
+    try {
+        $score = Get-MgSecuritySecureScore -Top 1 -ErrorAction Stop | Select-Object -First 1
+        if (-not $score) {
+            Add-ReportWarning -Section 'SecureScore' -Message 'No secure score data returned by Graph.'
+            return $null
+        }
+
+        Write-Step 'Fetching control profile definitions for accurate max-score join...'
+        $profiles = Get-MgSecuritySecureScoreControlProfile -All -ErrorAction SilentlyContinue
+        $profileByName = @{}
+        foreach ($p in $profiles) {
+            if ($p.Id) { $profileByName[$p.Id] = $p }
+        }
+
+        $overallPct = if ($score.MaxScore -gt 0) { [math]::Round(($score.CurrentScore / $score.MaxScore) * 100, 1) } else { 0 }
+
+        $identityControls = $score.ControlScores | Where-Object { $_.ControlCategory -eq 'Identity' }
+
+        $identityDetail = $identityControls | ForEach-Object {
+            $ctrl = $_
+            $maxScore = $null
+            if ($profileByName.ContainsKey($ctrl.ControlName)) {
+                $maxScore = $profileByName[$ctrl.ControlName].MaxScore
+            }
+            $gap = if ($maxScore) { [math]::Round($maxScore - $ctrl.Score, 2) } else { $null }
+            [PSCustomObject]@{
+                ControlName = $ctrl.ControlName
+                Description = $ctrl.Description
+                Score       = [math]::Round($ctrl.Score, 2)
+                MaxScore    = $maxScore
+                Gap         = $gap
+                Implemented = if ($maxScore) { $ctrl.Score -ge $maxScore } else { $null }
+            }
+        }
+
+        # Identity category totals: sum of achieved vs sum of max (where max is known)
+        $identityAchieved = ($identityDetail | Measure-Object -Property Score -Sum).Sum
+        $identityMaxKnown  = ($identityDetail | Where-Object { $_.MaxScore } | Measure-Object -Property MaxScore -Sum).Sum
+        $identityPct = if ($identityMaxKnown -gt 0) { [math]::Round(($identityAchieved / $identityMaxKnown) * 100, 1) } else { $null }
+
+        $topOpportunities = $identityDetail |
+            Where-Object { $_.MaxScore -and -not $_.Implemented } |
+            Sort-Object -Property Gap -Descending |
+            Select-Object -First 10
+
+        [PSCustomObject]@{
+            OverallCurrentScore = [math]::Round($score.CurrentScore, 1)
+            OverallMaxScore     = [math]::Round($score.MaxScore, 1)
+            OverallPercent      = $overallPct
+            IdentityPercent     = $identityPct
+            IdentityControlCount = @($identityDetail).Count
+            TopOpportunities    = $topOpportunities
+            AllIdentityControls = $identityDetail | Sort-Object ControlName
+            CreatedDateTime     = $score.CreatedDateTime
+        }
+    }
+    catch {
+        Add-ReportWarning -Section 'SecureScore' -Message $_.Exception.Message
+        $null
+    }
+}
+
+function Get-UserSettingsData {
+    Write-Section 'Collecting User settings (Entra admin center: Users > User settings)'
+    try {
+        $authPolicy = Get-MgPolicyAuthorizationPolicy -ErrorAction Stop | Select-Object -First 1
+        $perms = $authPolicy.DefaultUserRolePermissions
+
+        $groupCreationRestricted = $null
+        try {
+            $groupSetting = Get-MgGroupSetting -All -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -eq 'Group.Unified' } | Select-Object -First 1
+            if ($groupSetting) {
+                $enableGroupCreationVal = ($groupSetting.Values | Where-Object { $_.Name -eq 'EnableGroupCreation' }).Value
+                $groupCreationRestricted = if ($null -ne $enableGroupCreationVal) { $enableGroupCreationVal -eq 'False' } else { $null }
+            }
+        }
+        catch { }
+
+        [PSCustomObject]@{
+            UsersCanRegisterApps          = [bool]$perms.AllowedToCreateApps
+            UsersCanCreateSecurityGroups  = [bool]$perms.AllowedToCreateSecurityGroups
+            UsersCanCreateM365Groups      = if ($null -ne $groupCreationRestricted) { -not $groupCreationRestricted } else { $null }
+            UsersCanCreateTenants         = [bool]$perms.AllowedToCreateTenants
+            UsersCanReadOtherUsers        = [bool]$perms.AllowedToReadOtherUsers
+            AdminsCanUseSspr              = [bool]$authPolicy.AllowedToUseSspr
+            GuestInviteSetting            = $authPolicy.AllowInvitesFrom
+            EmailVerifiedUsersCanJoin     = [bool]$authPolicy.AllowEmailVerifiedUsersToJoinOrganization
+            LegacyMsolPowerShellBlocked   = [bool]$authPolicy.BlockMsolPowerShell
+        }
+    }
+    catch {
+        Add-ReportWarning -Section 'UserSettings' -Message $_.Exception.Message
+        $null
+    }
+}
+
 #endregion Data Collection
 
 #region Report Rendering
@@ -591,6 +694,8 @@ function New-HtmlReport {
     $apps = $Data.Applications
     $exo  = $Data.ExchangeOnline
     $spo  = $Data.SharePoint
+    $sscore = $Data.SecureScore
+    $usettings = $Data.UserSettings
 
     $sb = [System.Text.StringBuilder]::new()
 
@@ -653,6 +758,8 @@ function New-HtmlReport {
   <a href="#apps">Applications</a>
   <a href="#exo">Exchange Online</a>
   <a href="#spo">SharePoint</a>
+  <a href="#securescore">Secure Score</a>
+  <a href="#usersettings">User Settings</a>
 </nav>
 <main>
 "@)
@@ -707,6 +814,22 @@ function New-HtmlReport {
     if ($spo) {
         [void]$sb.AppendLine(@"
 <div class="card"><div class="label">SharePoint Storage</div><div class="value">$($spo.TotalStorageUsedGb) GB</div><div class="sub">$(Format-Number $spo.SiteCount) sites</div></div>
+"@)
+    }
+    if ($sscore) {
+        $ssCls = if ($sscore.OverallPercent -ge 70) { 'pill-good' } elseif ($sscore.OverallPercent -ge 40) { 'pill-warn' } else { 'pill-bad' }
+        $idPctText = if ($null -ne $sscore.IdentityPercent) { "$($sscore.IdentityPercent)%" } else { 'N/A' }
+        [void]$sb.AppendLine(@"
+<div class="card"><div class="label">Secure Score</div><div class="value"><span class="pill $ssCls">$($sscore.OverallPercent)%</span></div><div class="sub">Identity: $idPctText</div></div>
+"@)
+    }
+    if ($usettings) {
+        $riskyCount = @(
+            $usettings.UsersCanRegisterApps, $usettings.UsersCanCreateSecurityGroups, $usettings.UsersCanCreateTenants
+        ) | Where-Object { $_ -eq $true } | Measure-Object | Select-Object -ExpandProperty Count
+        $usCls = if ($riskyCount -eq 0) { 'pill-good' } elseif ($riskyCount -le 1) { 'pill-warn' } else { 'pill-bad' }
+        [void]$sb.AppendLine(@"
+<div class="card"><div class="label">User Settings</div><div class="value"><span class="pill $usCls">$riskyCount</span></div><div class="sub">permissive default(s) enabled</div></div>
 "@)
     }
     [void]$sb.AppendLine('</div>')
@@ -873,6 +996,61 @@ function New-HtmlReport {
         [void]$sb.AppendLine('<div class="skipped">SharePoint section skipped or unavailable - see warnings.</div>')
     }
 
+    # ---- Identity Secure Score ----
+    [void]$sb.AppendLine('<h2 id="securescore">Identity Secure Score</h2>')
+    if ($sscore) {
+        $idPctText = if ($null -ne $sscore.IdentityPercent) { "$($sscore.IdentityPercent)%" } else { 'N/A (max-score data unavailable for some controls)' }
+        [void]$sb.AppendLine(@"
+<table>
+<tr><th>Overall Secure Score</th><td>$($sscore.OverallCurrentScore) / $($sscore.OverallMaxScore) ($($sscore.OverallPercent)%)</td></tr>
+<tr><th>Identity Category Score</th><td>$idPctText</td></tr>
+<tr><th>Identity Controls Tracked</th><td>$($sscore.IdentityControlCount)</td></tr>
+<tr><th>Score Snapshot Date</th><td>$($sscore.CreatedDateTime)</td></tr>
+</table>
+"@)
+        if ($sscore.TopOpportunities -and $sscore.TopOpportunities.Count -gt 0) {
+            [void]$sb.AppendLine('<p class="note">Top unimplemented Identity controls, ranked by points available:</p>')
+            [void]$sb.AppendLine('<table><tr><th>Control</th><th>Description</th><th>Current</th><th>Max</th><th>Points Available</th></tr>')
+            foreach ($c in $sscore.TopOpportunities) {
+                [void]$sb.AppendLine("<tr><td>$([System.Net.WebUtility]::HtmlEncode($c.ControlName))</td><td>$([System.Net.WebUtility]::HtmlEncode($c.Description))</td><td>$($c.Score)</td><td>$($c.MaxScore)</td><td>$($c.Gap)</td></tr>")
+            }
+            [void]$sb.AppendLine('</table>')
+        }
+        else {
+            [void]$sb.AppendLine('<p class="note">No outstanding Identity control opportunities found (or max-score data was unavailable to calculate gaps).</p>')
+        }
+    } else {
+        [void]$sb.AppendLine('<div class="skipped">Secure Score data unavailable - see warnings.</div>')
+    }
+
+    # ---- User Settings ----
+    [void]$sb.AppendLine('<h2 id="usersettings">User Settings</h2>')
+    if ($usettings) {
+        function Get-SettingPill {
+            param($Value, [bool]$TrueIsRisky = $true)
+            if ($null -eq $Value) { return '<span class="pill">unknown</span>' }
+            $cls = if ($Value -eq $TrueIsRisky) { 'pill-warn' } else { 'pill-good' }
+            return "<span class=""pill $cls"">$Value</span>"
+        }
+        [void]$sb.AppendLine(@"
+<p class="note">Mirrors the Entra admin center &rarr; Users &rarr; User settings blade. Amber flags a permissive default Microsoft recommends reviewing.</p>
+<table>
+<tr><th>Setting</th><th>Value</th></tr>
+<tr><td>Users can register applications</td><td>$(Get-SettingPill $usettings.UsersCanRegisterApps)</td></tr>
+<tr><td>Users can create security groups</td><td>$(Get-SettingPill $usettings.UsersCanCreateSecurityGroups)</td></tr>
+<tr><td>Users can create Microsoft 365 groups</td><td>$(Get-SettingPill $usettings.UsersCanCreateM365Groups)</td></tr>
+<tr><td>Users can create tenants</td><td>$(Get-SettingPill $usettings.UsersCanCreateTenants)</td></tr>
+<tr><td>Users can read other users' full profiles</td><td>$(Get-SettingPill $usettings.UsersCanReadOtherUsers)</td></tr>
+<tr><td>Admins can use Self-Service Password Reset</td><td>$(Get-SettingPill $usettings.AdminsCanUseSspr $false)</td></tr>
+<tr><td>Guest invite setting</td><td>$($usettings.GuestInviteSetting)</td></tr>
+<tr><td>Email-verified users can join org</td><td>$(Get-SettingPill $usettings.EmailVerifiedUsersCanJoin)</td></tr>
+<tr><td>Legacy MSOL PowerShell blocked</td><td>$(Get-SettingPill $usettings.LegacyMsolPowerShellBlocked $false)</td></tr>
+</table>
+"@)
+    } else {
+        [void]$sb.AppendLine('<div class="skipped">User settings data unavailable - see warnings.</div>')
+    }
+
     # ---- Warnings ----
     if ($Data.Meta.Warnings -and $Data.Meta.Warnings.Count -gt 0) {
         [void]$sb.AppendLine('<div class="warnings"><h3>Collection Warnings</h3><ul>')
@@ -905,6 +1083,8 @@ function New-MarkdownReport {
     $apps = $Data.Applications
     $exo  = $Data.ExchangeOnline
     $spo  = $Data.SharePoint
+    $sscore = $Data.SecureScore
+    $usettings = $Data.UserSettings
 
     $md = [System.Text.StringBuilder]::new()
     [void]$md.AppendLine("# Tenant Configuration Report$(if ($ti) { " - $($ti.DisplayName)" })")
@@ -921,6 +1101,7 @@ function New-MarkdownReport {
     if ($mfa) { [void]$md.AppendLine("- **MFA Capable:** $($mfa.PercentMfaCapable)% ($($mfa.AdminsWithoutMfa) admins without MFA)") }
     if ($exo) { [void]$md.AppendLine("- **Mailboxes:** $($exo.TotalMailboxes)") }
     if ($spo) { [void]$md.AppendLine("- **SharePoint Storage:** $($spo.TotalStorageUsedGb) GB across $($spo.SiteCount) sites") }
+    if ($sscore) { [void]$md.AppendLine("- **Secure Score:** $($sscore.OverallPercent)% overall, Identity: $(if ($null -ne $sscore.IdentityPercent) { "$($sscore.IdentityPercent)%" } else { 'N/A' })") }
 
     if ($ti) {
         [void]$md.AppendLine("`n## Tenant & Domains`n")
@@ -999,6 +1180,35 @@ function New-MarkdownReport {
         [void]$md.AppendLine("`n## SharePoint & OneDrive`n")
         [void]$md.AppendLine("| Metric | Value |`n|---|---|")
         [void]$md.AppendLine("| Site Collections | $($spo.SiteCount) |`n| Storage Used | $($spo.TotalStorageUsedGb) GB |`n| Sharing Capability | $($spo.SharingCapability) |`n| OneDrive Sharing Capability | $($spo.OneDriveSharingCapability) |`n| Default Link Permission | $($spo.DefaultLinkPermission) |`n| Legacy Auth Blocked | $($spo.LegacyAuthProtocolsEnabled) |")
+    }
+
+    if ($sscore) {
+        [void]$md.AppendLine("`n## Identity Secure Score`n")
+        $idPctText = if ($null -ne $sscore.IdentityPercent) { "$($sscore.IdentityPercent)%" } else { 'N/A' }
+        [void]$md.AppendLine("| Metric | Value |`n|---|---|")
+        [void]$md.AppendLine("| Overall Score | $($sscore.OverallCurrentScore) / $($sscore.OverallMaxScore) ($($sscore.OverallPercent)%) |`n| Identity Category | $idPctText |`n| Identity Controls Tracked | $($sscore.IdentityControlCount) |`n| Snapshot Date | $($sscore.CreatedDateTime) |")
+        if ($sscore.TopOpportunities -and $sscore.TopOpportunities.Count -gt 0) {
+            [void]$md.AppendLine("`n### Top Unimplemented Identity Controls`n")
+            [void]$md.AppendLine("| Control | Description | Current | Max | Points Available |`n|---|---|---|---|---|")
+            foreach ($c in $sscore.TopOpportunities) {
+                [void]$md.AppendLine("| $($c.ControlName) | $($c.Description) | $($c.Score) | $($c.MaxScore) | $($c.Gap) |")
+            }
+        }
+    }
+
+    if ($usettings) {
+        [void]$md.AppendLine("`n## User Settings`n")
+        [void]$md.AppendLine("Mirrors Entra admin center -> Users -> User settings.`n")
+        [void]$md.AppendLine("| Setting | Value |`n|---|---|")
+        [void]$md.AppendLine("| Users can register applications | $($usettings.UsersCanRegisterApps) |")
+        [void]$md.AppendLine("| Users can create security groups | $($usettings.UsersCanCreateSecurityGroups) |")
+        [void]$md.AppendLine("| Users can create Microsoft 365 groups | $($usettings.UsersCanCreateM365Groups) |")
+        [void]$md.AppendLine("| Users can create tenants | $($usettings.UsersCanCreateTenants) |")
+        [void]$md.AppendLine("| Users can read other users' full profiles | $($usettings.UsersCanReadOtherUsers) |")
+        [void]$md.AppendLine("| Admins can use SSPR | $($usettings.AdminsCanUseSspr) |")
+        [void]$md.AppendLine("| Guest invite setting | $($usettings.GuestInviteSetting) |")
+        [void]$md.AppendLine("| Email-verified users can join org | $($usettings.EmailVerifiedUsersCanJoin) |")
+        [void]$md.AppendLine("| Legacy MSOL PowerShell blocked | $($usettings.LegacyMsolPowerShellBlocked) |")
     }
 
     if ($Data.Meta.Warnings -and $Data.Meta.Warnings.Count -gt 0) {
@@ -1092,6 +1302,8 @@ try {
     $script:Report.Applications      = Get-ApplicationsData
     $script:Report.ExchangeOnline    = if ($exoConnected) { Get-ExchangeOnlineData } else { $null }
     $script:Report.SharePoint        = if ($spoConnected) { Get-SharePointData } else { $null }
+    $script:Report.SecureScore       = Get-SecureScoreData
+    $script:Report.UserSettings      = Get-UserSettingsData
 
     $script:Report.Meta = [PSCustomObject]@{
         GeneratedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
