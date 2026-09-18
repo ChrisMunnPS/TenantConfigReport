@@ -199,6 +199,7 @@ You'll be prompted to sign in once per connected service (up to three times: Gra
 | `-SkipExchange` | switch | off | Skip the Exchange Online connection and section |
 | `-SkipSharePoint` | switch | off | Skip the SharePoint Online connection and section |
 | `-SkipPdf` | switch | off | Skip PDF generation (HTML and Markdown are unaffected) |
+| `-Redact` | switch | off | Redacts possible sensitive information.  Useful when sharing reports outside of IT |
 
 ---
 
